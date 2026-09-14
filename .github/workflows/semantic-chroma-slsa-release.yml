@@ -1,0 +1,214 @@
+# Copyright (c) 2026 Tarek Wasfy
+name: Semantic Chroma - SLSA Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      module_path:
+        description: "Tracked repository path to package (use . for the complete module repository)"
+        required: true
+        default: "."
+      release_tag:
+        description: "Optional release tag (for example v1.0.0); empty generates v0.1.<run number>"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Package Semantic Chroma
+    runs-on: ubuntu-latest
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
+    steps:
+      - name: Checkout repository including Git LFS objects
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Materialize and verify Git LFS files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git lfs pull
+          git lfs fsck
+
+      - name: Build ZIP from tracked working-tree files
+        env:
+          MODULE_PATH: ${{ inputs.module_path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import subprocess
+          import zipfile
+
+          root = pathlib.Path.cwd().resolve()
+          raw = os.environ.get("MODULE_PATH", ".").strip() or "."
+          normalized = raw.replace("\\", "/")
+          requested = pathlib.PurePosixPath(normalized)
+          if requested.is_absolute() or ".." in requested.parts:
+              raise SystemExit(f"Unsafe module_path: {raw!r}")
+          if normalized != ".":
+              selected_dir = (root / pathlib.Path(*requested.parts)).resolve()
+              if not selected_dir.is_relative_to(root) or not selected_dir.is_dir():
+                  raise SystemExit(f"module_path is not a repository directory: {raw!r}")
+              listing = subprocess.run(
+                  ["git", "ls-files", "-z", "--", normalized],
+                  check=True,
+                  stdout=subprocess.PIPE,
+              ).stdout
+          else:
+              listing = subprocess.run(
+                  ["git", "ls-files", "-z"], check=True, stdout=subprocess.PIPE
+              ).stdout
+
+          paths = [entry.decode("utf-8") for entry in listing.split(b"\0") if entry]
+          if not paths:
+              raise SystemExit(f"No tracked files found under module_path={raw!r}")
+
+          output = root / "dist" / "Semantic-Chroma.zip"
+          lfs_pointer = b"version https://git-lfs.github.com/spec/v1"
+          with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for relative in sorted(paths):
+                  source = (root / pathlib.Path(*pathlib.PurePosixPath(relative).parts)).resolve(strict=True)
+                  if not source.is_relative_to(root) or not source.is_file():
+                      raise SystemExit(f"Tracked path is missing or escapes the checkout: {relative}")
+                  with source.open("rb") as stream:
+                      prefix = stream.read(len(lfs_pointer))
+                  if prefix == lfs_pointer:
+                      raise SystemExit(f"Git LFS pointer was not materialized: {relative}")
+                  archive.write(source, arcname=relative)
+
+          print(f"Packaged {len(paths)} tracked files into {output}")
+          print(f"Archive size: {output.stat().st_size} bytes")
+          PY
+          ls -lh dist/Semantic-Chroma.zip
+
+      - name: Generate SLSA subject and checksum
+        id: hash
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum Semantic-Chroma.zip | tee Semantic-Chroma.zip.sha256
+          echo "hashes=$(sha256sum Semantic-Chroma.zip | base64 -w0)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload packaged module
+        uses: actions/upload-artifact@v4
+        with:
+          name: Semantic-Chroma
+          path: |
+            dist/Semantic-Chroma.zip
+            dist/Semantic-Chroma.zip.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  prepare_release:
+    name: Prepare draft release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Select and validate release tag
+        id: meta
+        env:
+          REQUESTED_TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${REQUESTED_TAG:-v0.1.${GITHUB_RUN_NUMBER}}"
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
+            echo "Invalid release tag: $TAG" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $TAG"
+
+      - name: Create draft GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release tag already exists: $TAG" >&2
+            exit 1
+          fi
+          gh release create "$TAG" \
+            --title "Semantic Chroma $TAG" \
+            --generate-notes \
+            --draft
+
+  provenance:
+    name: Generate SLSA Level 3 provenance
+    needs:
+      - build
+      - prepare_release
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: ${{ needs.build.outputs.hashes }}
+      upload-assets: true
+      upload-tag-name: ${{ needs.prepare_release.outputs.tag }}
+      provenance-name: Semantic-Chroma.intoto.jsonl
+
+  release:
+    name: Publish attested release
+    needs:
+      - build
+      - prepare_release
+      - provenance
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download packaged module
+        uses: actions/download-artifact@v4
+        with:
+          name: Semantic-Chroma
+          path: dist
+
+      - name: Verify published ZIP checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum --check Semantic-Chroma.zip.sha256
+
+      - name: Upload Semantic Chroma release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare_release.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" \
+            dist/Semantic-Chroma.zip \
+            dist/Semantic-Chroma.zip.sha256 \
+            --clobber
+
+      - name: Publish release after provenance succeeds
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare_release.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --draft=false
+          echo "Published Semantic Chroma $TAG with SLSA provenance."
