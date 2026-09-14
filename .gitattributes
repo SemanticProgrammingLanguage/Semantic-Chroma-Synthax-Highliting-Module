@@ -1,0 +1,2 @@
+*.se filter=lfs diff=lfs merge=lfs -text
+*.spz filter=lfs diff=lfs merge=lfs -text
